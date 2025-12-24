@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 
@@ -24,6 +23,7 @@ from AVHRR_collocation_pipeline.readers.AutoSnow_reference import (
 from AVHRR_collocation_pipeline.readers.AutoSnow_reader import (
     collocate_AutoSnow,
 )
+
 # ---------------- MERRA2 ----------------
 from AVHRR_collocation_pipeline.readers.MERRA2_reference import (
     load_MERRA2_reference,
@@ -31,6 +31,9 @@ from AVHRR_collocation_pipeline.readers.MERRA2_reference import (
 from AVHRR_collocation_pipeline.readers.MERRA2_reader import (
     collocate_MERRA2,
 )
+
+# ------------------ add this import near the top ------------------
+from AVHRR_collocation_pipeline.reproject import reproject_vars_wgs_to_polar
 
 import AVHRR_collocation_pipeline.utils as utils
 
@@ -46,6 +49,10 @@ OUT_DIR = "/home/omidzandi/test_maps/"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 GRID_RES: float = 0.5  # degrees
+
+# Hemisphere split thresholds (also reusable later for reprojection)
+LAT_THRESH_NH: float = 55.0
+LAT_THRESH_SH: float = -55.0
 
 AVHRR_VARS: list[str] = [
     "cloud_probability",
@@ -68,14 +75,15 @@ MERRA2_DIR: str = (
     "/ra1/pubdat/AVHRR_CloudSat_proj/MERRA2/merra2_archive_19800101_20250831"
 )
 
-# Which MERRA2 variables to collocate (edit to match what you want)
-# Must exist inside your daily files.
+# Which MERRA2 variables to collocate (must exist inside your daily files)
 MERRA2_VARS: list[str] = [
     "TQV",
-    "T2M"
+    "T2M",
 ]
 
-AUTOSNOW_DIR: str = "/ra1/pubdat/AVHRR_CloudSat_proj/Autosnow_archive_1987_june2023/autosnow_in_geotif"
+AUTOSNOW_DIR: str = (
+    "/ra1/pubdat/AVHRR_CloudSat_proj/Autosnow_archive_1987_june2023/autosnow_in_geotif"
+)
 
 # Which layers to save as GeoTIFF
 SAVE_LAYERS: list[str] = [
@@ -84,8 +92,16 @@ SAVE_LAYERS: list[str] = [
     "ERA5_tp",
     "TQV",
     "T2M",
-    "AutoSnow"
+    "AutoSnow",
 ]
+
+# Polar reprojection controls
+DO_REPROJECT_TO_POLAR: bool = True
+POLAR_OUT_DIR: str = "/home/omidzandi/test_maps_polar/"
+os.makedirs(POLAR_OUT_DIR, exist_ok=True)
+
+LAT_TS_NH: float = 70.0
+LAT_TS_SH: float = -71.0
 
 # -----------------------------------------
 # LOAD REFERENCES ONCE FOR THE TEST
@@ -121,7 +137,8 @@ def test_AVHRR_collocation() -> None:
       2) Collocate IMERG precipitation
       3) Collocate ERA5 precipitation
       4) Collocate MERRA2 variables (hourly, one file per day)
-      5) Save selected layers as GeoTIFFs
+      5) Collocate AutoSnow (daily GeoTIFF)
+      6) Save selected layers as GeoTIFFs
     """
 
     # ------------------------------------------------------
@@ -145,6 +162,8 @@ def test_AVHRR_collocation() -> None:
         x,
         y,
         avh_vars=AVHRR_VARS,
+        lat_thresh_N_hemisphere=LAT_THRESH_NH,
+        lat_thresh_S_hemisphere=LAT_THRESH_SH,
     )
 
     if df is None or df.empty:
@@ -174,16 +193,6 @@ def test_AVHRR_collocation() -> None:
     print(df[["lon", "lat", "scan_line_times", "IMERG_preci", era5_col]].head())
     _print_nan_diagnostics(df, era5_col, "ERA5")
 
-    print("\nMERRA2 debug:")
-    print("  df scan_date sample:", df["scan_date"].iloc[0], type(df["scan_date"].iloc[0]))
-    print("  df scan_date unique (first 5):", np.unique(df["scan_date"].astype(str).values)[:5])
-    print("  meta keys (first 5):", list(MERRA2_meta["date_to_file"].keys())[:5])
-
-    print("  AVHRR lon min/max:", df["lon"].min(), df["lon"].max())
-    print("  AVHRR lat min/max:", df["lat"].min(), df["lat"].max())
-    print("  MERRA2 lon min/max:", MERRA2_meta["lon"].min(), MERRA2_meta["lon"].max())
-    print("  MERRA2 lat min/max:", MERRA2_meta["lat"].min(), MERRA2_meta["lat"].max())
-
     # ------------------------------------------------------
     # 6) Collocate MERRA2 (hourly, one file per day)
     # ------------------------------------------------------
@@ -194,13 +203,12 @@ def test_AVHRR_collocation() -> None:
 
         print("\nAVHRR + IMERG + ERA5 + MERRA2 (sample rows):")
         show_cols = ["lon", "lat", "scan_line_times", "IMERG_preci", era5_col]
-        show_cols += [f"MERRA2_{v}" for v in MERRA2_VARS if f"MERRA2_{v}" in df.columns]
+        show_cols += [v for v in MERRA2_VARS if v in df.columns]
         print(df[show_cols].head())
 
         for v in MERRA2_VARS:
-            col = f"MERRA2_{v}"
-            if col in df.columns:
-                _print_nan_diagnostics(df, col, f"MERRA2 {v}")
+            if v in df.columns:
+                _print_nan_diagnostics(df, v, f"MERRA2 {v}")
 
     # ------------------------------------------------------
     # 7) Collocate AutoSnow (daily GeoTIFF)
@@ -221,6 +229,54 @@ def test_AVHRR_collocation() -> None:
         _save_layer_to_tiff(df, layer, avh_file, x_vec, y_vec)
 
     print("\n✅ AVHRR collocation test pipeline completed.\n")
+
+    # ------------------------------------------------------
+    # 9) Reproject selected WGS grids → Polar stereographic
+    #     and save as NetCDF (Panoply-friendly)
+    # ------------------------------------------------------
+    DO_REPROJECT_TO_POLAR = True
+    POLAR_OUT_DIR = "/home/omidzandi/test_maps_polar/"
+    os.makedirs(POLAR_OUT_DIR, exist_ok=True)
+
+    if DO_REPROJECT_TO_POLAR:
+        print("\nReprojecting WGS grids to Polar stereographic (NH / SH)")
+
+        orbit_tag = os.path.splitext(os.path.basename(avh_file))[0]
+
+        # Build WGS grids once
+        var_grids = {}
+        for v in SAVE_LAYERS:
+            if v not in df.columns:
+                print(f"WARNING: '{v}' not found — skipping.")
+                continue
+            var_grids[v] = utils.df2grid(df, v, x_vec, y_vec).astype("float32")
+
+        # Reproject all variables
+        polar = reproject_vars_wgs_to_polar(
+            var_grids,
+            orbit_tag=orbit_tag,
+            x_vec=x_vec,
+            y_vec=y_vec,
+            grid_resolution=GRID_RES,
+            lat_thresh_nh=LAT_THRESH_NH,
+            lat_thresh_sh=LAT_THRESH_SH,
+            lat_ts_nh=70.0,
+            lat_ts_sh=-71.0,
+            nodata=-9999.0,
+        )
+
+        print("polar type:", type(polar))
+        try:
+            print("polar keys:", polar.keys())
+        except Exception as e:
+            print("polar has no keys():", e)
+
+        # Save NH / SH NetCDFs
+        utils.save_polar_netcdf(
+            polar,
+            out_dir=POLAR_OUT_DIR,
+            orbit_tag=orbit_tag,
+        )
 
 
 if __name__ == "__main__":

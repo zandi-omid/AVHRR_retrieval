@@ -6,7 +6,11 @@ import rasterio
 from rasterio.transform import from_origin
 from typing import Tuple
 import random
-from typing import Union, List
+from typing import Union, List, Dict, Any, Optional
+import xarray as xr
+import datetime
+
+
 
 # functions
 
@@ -335,3 +339,85 @@ def add_time_columns(
         out["scan_halfhour_unix"] = ((t + 900) // 1800 * 1800).astype("int64")
 
     return out
+
+
+
+def save_polar_netcdf(
+    polar_vars: Dict[str, Any],
+    *,
+    orbit_tag: str,
+    out_dir: str,
+    compress_level: int = 4,
+) -> None:
+    """
+    Save NH / SH polar-stereographic variables to NetCDF.
+
+    Expected structure (minimum):
+        polar_vars = {
+            "NH": {varname: (("y","x"), array2d), ...},
+            "SH": {varname: (("y","x"), array2d), ...},
+        }
+
+    Optional (if you called reproject_vars_wgs_to_polar(..., return_coords=True)):
+        polar_vars["coords"] = {
+            "NH": {"x": x_coords_nh, "y": y_coords_nh},
+            "SH": {"x": x_coords_sh, "y": y_coords_sh},
+        }
+    """
+    if not isinstance(polar_vars, dict):
+        raise TypeError("polar_vars must be a dict")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    coords_block: Optional[Dict[str, Any]] = None
+    if "coords" in polar_vars:
+        if isinstance(polar_vars["coords"], dict):
+            coords_block = polar_vars["coords"]
+
+    for hemi in ("NH", "SH"):
+        hemi_vars = polar_vars.get(hemi, None)
+        if hemi_vars is None:
+            print(f"[WARN] {hemi} not found in polar_vars — skipping")
+            continue
+        if not isinstance(hemi_vars, dict):
+            raise TypeError(f"polar_vars['{hemi}'] must be a dict of variables")
+
+        ds = xr.Dataset(hemi_vars)
+
+        # Attach coords (strongly recommended for Panoply)
+        if coords_block is not None and hemi in coords_block:
+            c = coords_block[hemi]
+            x = c.get("x", None)
+            y = c.get("y", None)
+
+            if x is not None and y is not None:
+                ds = ds.assign_coords(
+                    x=np.asarray(x, dtype="float64"),
+                    y=np.asarray(y, dtype="float64"),
+                )
+
+        out_nc = os.path.join(out_dir, f"{orbit_tag}_{hemi}_polar.nc")
+
+        encoding = {v: {"zlib": True, "complevel": int(compress_level)} for v in ds.data_vars}
+
+        ds.to_netcdf(out_nc, format="NETCDF4", encoding=encoding)
+        print(f"Saved {hemi} polar NetCDF → {out_nc}")
+
+def AVHRR_datetime_NC_files(AVHRR_file):
+
+    name_splited = os.path.basename(AVHRR_file).split('.')
+
+    yr_DOY = name_splited[3][1:]
+    st_time = name_splited[4][1:]
+    end_time = name_splited[5][1:]
+    yr = datetime.datetime.strptime(yr_DOY, '%y%j').year
+
+    st_dt = datetime.datetime.strptime(yr_DOY + st_time, '%y%j%H%M')
+
+    end_dt = datetime.datetime.strptime(yr_DOY + end_time, '%y%j%H%M')
+
+    if end_dt < st_dt:
+        #files which ending time is few moments after 00:00 pm
+        end_dt = end_dt + datetime.timedelta(days=1)
+
+    return st_dt, end_dt, yr
