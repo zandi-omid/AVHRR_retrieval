@@ -68,31 +68,30 @@ def index_finder(
     return idx, idy
 
 
-
 def df2grid(
     df,
     var_name: str,
     x_vec: np.ndarray,
     y_vec: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
 ) -> np.ndarray:
     """
-    Convert a DataFrame with lon/lat and variable into a 2D grid,
-    using utils.index_finder for consistency with the main AVHRR pipeline.
+    Old-style df2grid, matching Omid's original pipeline.
+
+    - Uses index_finder(lon, lat, x_vec, y_vec)
+    - Writes directly into a grid shaped like x,y
+    - Keeps NaNs as in the original implementation
     """
+    # Compute indices using the SAME binning logic as before
+    idx, idy = index_finder(df["lon"].values, df["lat"].values, x_vec, y_vec)
 
-    # Extract lon/lat and variable as arrays
-    lon = df["lon"].values
-    lat = df["lat"].values
-    var = df[var_name].values
+    # Optional safety: only keep points that land on the grid
+    valid = (idx >= 0) & (idy >= 0) & np.isfinite(df[var_name].values)
 
-    # Use the SAME grid mapper as the AVHRR reader
-    idx, idy = index_finder(lon, lat, x_vec, y_vec)
+    grid = np.full_like(x, np.nan, dtype=float)
 
-    # Only keep points that fall on the grid
-    valid = (idx >= 0) & (idy >= 0) & (~np.isnan(var))
-
-    grid = np.full((len(y_vec), len(x_vec)), np.nan, dtype=float)
-    grid[idy[valid], idx[valid]] = var[valid]
+    grid[idy[valid], idx[valid]] = df[var_name].values[valid]
 
     return grid
 

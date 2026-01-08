@@ -66,6 +66,10 @@ class AVHRRProcessor:
         """
         x_vec, y_vec, x, y = utils.build_test_grid(self.grid_res)
 
+        # store grid for later use in df2grid
+        self._x_grid = x
+        self._y_grid = y
+
         df = read_AVHRR_orbit_to_df(
             avh_file,
             x_vec,
@@ -112,12 +116,26 @@ class AVHRRProcessor:
     # 3) Build 2D WGS grids for selected variables
     # --------------------------------------------------------
     def build_var_grids(self, df, x_vec, y_vec, varnames: List[str]) -> Dict[str, np.ndarray]:
+        if not hasattr(self, "_x_grid") or not hasattr(self, "_y_grid"):
+            raise RuntimeError("x/y grid not set on AVHRRProcessor. Did you call load_orbit_df first?")
+
         var_grids: Dict[str, np.ndarray] = {}
         for v in varnames:
             if v not in df.columns:
                 print(f"[WARN] '{v}' not found in df — skipping grid")
                 continue
-            var_grids[v] = utils.df2grid(df, v, x_vec, y_vec).astype("float32")
+
+            grid = utils.df2grid(
+                df,
+                v,
+                x_vec=x_vec,
+                y_vec=y_vec,
+                x=self._x_grid,
+                y=self._y_grid,
+            ).astype("float32")
+
+            var_grids[v] = grid
+
         return var_grids
 
     # --------------------------------------------------------
@@ -134,8 +152,7 @@ class AVHRRProcessor:
             lat_thresh_sh=self.lat_thresh_sh,
             lat_ts_nh=self.lat_ts_nh,
             lat_ts_sh=self.lat_ts_sh,
-            nodata=self.nodata,
-            return_coords=True,   # IMPORTANT: ensures x/y vectors exist for NH/SH
+            nodata=self.nodata
         )
 
     # --------------------------------------------------------
@@ -180,6 +197,18 @@ class AVHRRProcessor:
 
         return out_nc
 
+    def _polar_to_dataset(self, polar: Dict, hemi: str) -> xr.Dataset:
+        """
+        Convert the 'polar' dict returned by wgs_to_polar into an
+        xarray.Dataset for a given hemisphere ("NH" or "SH").
+        """
+        ds = xr.Dataset(polar[hemi])
+        ds = ds.assign_coords(
+            x=np.asarray(polar["coords"][hemi]["x"]),
+            y=np.asarray(polar["coords"][hemi]["y"]),
+        )
+        return ds
+
     # --------------------------------------------------------
     # 6) One-step pipeline for a single orbit
     # --------------------------------------------------------
@@ -212,15 +241,19 @@ class AVHRRProcessor:
         # 2) Collocate DL features (no IMERG/ERA5)
         df = self.collocate_dl_features(df, merra2_vars=merra2_vars)
 
+        # df.to_pickle('/xdisk/behrangi/omidzandi/retrieved_maps/test_dfs/df_new.pkl')
+
         orbit_tag = Path(avh_file).stem
 
         # 3) Grid required DL inputs
         var_grids = self.build_var_grids(df, x_vec, y_vec, input_vars)
 
-        # 4) Reproject to polar
+        np.savez("/xdisk/behrangi/omidzandi/retrieved_maps/test/2010_new_var_grids_debug.npz", **var_grids)
+
+        # 4) Reproject to polar (still returns the dict)
         polar = self.wgs_to_polar(var_grids, orbit_tag, x_vec, y_vec)
 
-        # 5) Write ONE polar NetCDF with NH/SH groups (optional)
+        # 5) Optionally write ONE polar NetCDF with NH/SH groups (no change)
         if out_polar_nc is not None:
             self.write_polar_groups_netcdf(
                 polar=polar,
@@ -229,4 +262,9 @@ class AVHRRProcessor:
                 default_scale=default_scale,
             )
 
-        return polar
+        # 6) Build in-memory datasets for NH / SH and return those
+        ds_nh = self._polar_to_dataset(polar, "NH")
+        ds_sh = self._polar_to_dataset(polar, "SH")
+
+        # You can return a dict or a tuple; I'll use a dict:
+        return {"NH": ds_nh, "SH": ds_sh}

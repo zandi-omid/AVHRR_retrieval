@@ -1,75 +1,71 @@
-"""
-Reprojection utilities
-----------------------
-
-WGS84 (lat/lon) gridded arrays -> Polar stereographic (NH/SH) using GDAL warp.
-
-- Writes intermediate GeoTIFFs into a TemporaryDirectory (fast, clean, no manual cleanup).
-- Uses nearest-neighbor resampling (matches your previous workflow).
-- Returns xarray.DataArray for single arrays, and dicts for multi-var workflows.
-
-Author: Omid Zandi
-"""
-
-from __future__ import annotations
+# AVHRR_collocation_pipeline/retrievers/reproject/wgs_to_polar.py
 
 import os
-import subprocess
 import tempfile
-from typing import Dict, Tuple, Optional, Any
+import subprocess
+from typing import Optional
 
 import numpy as np
-import rasterio
 import xarray as xr
 from osgeo import gdal, osr
+import rasterio
 
 
-# Optional: reduce GDAL chatter
-gdal.PushErrorHandler("CPLQuietErrorHandler")
-
-
-def _save_geotiff_wgs(
-    path: str,
-    array2d: np.ndarray,
-    *,
+def _gdal_based_save_array_to_disk(
+    dst_filename: str,
+    xpx: int,
+    ypx: int,
+    px_sz: float,
     minx: float,
     maxy: float,
-    px_sz: float,
-    nodata: float,
+    crs: str,
+    crs_format: str,
+    array_to_save: np.ndarray,
 ) -> None:
     """
-    Save a (lat, lon) 2D array as a WGS84 GeoTIFF using GDAL.
-    GeoTransform uses (minx, px_sz, 0, maxy, 0, -px_sz).
+    Exact port of your old gdal_based_save_array_to_disk.
+
+    Saves a 2D array to GeoTIFF with given geotransform and CRS.
+    Clamps bottom latitude to -90 if necessary (matching old behavior).
     """
-    ypx, xpx = array2d.shape
+    # Clamp bottom latitude
+    bottom_latitude = maxy - (ypx * px_sz)
+    if bottom_latitude < -90.0:
+        bottom_latitude = -90.0
+        ypx = int((maxy - bottom_latitude) / px_sz)
+        array_to_save = array_to_save[:ypx, :]
 
     srs = osr.SpatialReference()
-    srs.ImportFromProj4("+proj=longlat +datum=WGS84 +no_defs")
-    proj_wkt = srs.ExportToWkt()
+    if crs_format == "proj4":
+        srs.ImportFromProj4(crs)
+        srs = srs.ExportToProj4()
+    elif crs_format == "WKT":
+        srs.ImportFromWkt(crs)
+        srs = srs.ExportToWkt()
 
-    drv = gdal.GetDriverByName("GTiff")
-    ds = drv.Create(
-        path,
-        xpx,
-        ypx,
-        1,
-        gdal.GDT_Float32,
-        options=["COMPRESS=LZW"],
+    driver = gdal.GetDriverByName("GTiff")
+    ds = driver.Create(dst_filename, xpx, ypx, 1, gdal.GDT_Float64)
+
+    ds.SetGeoTransform(
+        (
+            minx,   # top-left x
+            px_sz,  # pixel width
+            0.0,    # rotation
+            maxy,   # top-left y
+            0.0,    # rotation
+            -px_sz, # pixel height (negative)
+        )
     )
 
-    ds.SetGeoTransform((float(minx), float(px_sz), 0.0, float(maxy), 0.0, -float(px_sz)))
-    ds.SetProjection(proj_wkt)
-
+    ds.SetProjection(srs)
     band = ds.GetRasterBand(1)
-    band.SetNoDataValue(float(nodata))
-    band.WriteArray(array2d.astype("float32", copy=False))
-    band.FlushCache()
+    band.WriteArray(array_to_save)
     ds.FlushCache()
-    ds = None
+    del ds
 
 
 def reproject_wgs_to_polar(
-    arr: np.ndarray,
+    grid: np.ndarray,
     hemisphere: str,
     lat_thresh: float,
     *,
@@ -78,123 +74,130 @@ def reproject_wgs_to_polar(
     grid_resolution: float,
     lat_ts_nh: float = 70.0,
     lat_ts_sh: float = -71.0,
-    nodata: float = -9999.0,
     tag: str = "reproj",
     tmp_root: Optional[str] = None,
 ) -> xr.DataArray:
     """
-    Reproject a WGS84 gridded array to polar stereographic (NH or SH).
-
-    Notes:
-    - `arr` is assumed to be shaped (len(y_vec), len(x_vec)) i.e. (lat, lon).
-    - Uses your original slicing logic:
-        NH: y_vec > lat_thresh
-        SH: y_vec <= lat_thresh
-    - Writes temp GeoTIFFs inside a TemporaryDirectory and reads result back via rasterio.
+    WGS84 → polar stereographic reprojection that reproduces the old
+    gdal_based_reproj_arr behavior as closely as possible.
 
     Parameters
     ----------
-    arr : np.ndarray
-        2D array on WGS grid (lat, lon).
-    hemisphere : {"NH","SH"}
-        Which hemisphere to produce.
+    grid : 2D np.ndarray
+        Global WGS84 grid (lat along axis 0, lon along axis 1).
+    hemisphere : {"NH", "SH"}
+        Hemisphere to slice and reproject.
     lat_thresh : float
-        Threshold used for hemisphere slicing (same meaning as your old y_min).
+        Latitude threshold used for NH/SH split (your y_min in old code).
     x_vec, y_vec : np.ndarray
-        WGS grid vectors (centers).
+        Longitude / latitude vectors for the global grid.
     grid_resolution : float
-        Grid spacing in degrees.
+        Grid spacing in degrees (e.g., 0.25).
     lat_ts_nh, lat_ts_sh : float
-        Latitude of true scale for polar stereographic.
-    nodata : float
-        Numeric nodata written to GeoTIFF (NaNs are converted to this before warp).
+        Standard parallels for stereographic projection (unchanged from old).
     tag : str
-        Used to name temp files.
-    tmp_root : str | None
-        Root folder for TemporaryDirectory (defaults to $TMPDIR or /tmp).
-
-    Returns
-    -------
-    xr.DataArray
-        Reprojected polar stereographic array with coords x/y (meters) + crs attr.
+        Name for the returned DataArray.
+    tmp_root : str or None
+        Directory to write temporary GeoTIFFs; if None, uses system temp.
     """
-    if hemisphere not in ("NH", "SH"):
-        raise ValueError("hemisphere must be 'NH' or 'SH'")
 
-    # Slice according to your original convention
+    # --- 1) Slice grid in latitude exactly like the old script ---
+
     if hemisphere == "NH":
-        mask = y_vec > lat_thresh
+        # y_min in old code == lat_thresh
+        sliced_arr = grid[y_vec > lat_thresh]
+    else:
+        sliced_arr = grid[y_vec <= lat_thresh]
+
+    ypx, xpx = sliced_arr.shape
+    px_sz = float(grid_resolution)
+
+    # This is exactly what you had in gdal_based_reproj_arr
+    minx = float(np.min(x_vec) + grid_resolution / 2.0)
+    if hemisphere == "NH":
+        maxy = float(np.max(y_vec) - grid_resolution / 2.0)
+    else:  # SH
+        maxy = float(lat_thresh - grid_resolution / 2.0)
+
+    # --- 2) Save hemisphere WGS GeoTIFF using the same CRS and logic as before ---
+
+    crs = "+proj=longlat +datum=WGS84 +no_defs"
+    crs_format = "proj4"
+
+    tmp_dir = tmp_root or tempfile.gettempdir()
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    base = f"tmp_{hemisphere}_{os.getpid()}"
+    wgs_tif = os.path.join(tmp_dir, base + "_wgs.tif")
+    stereo_tif = os.path.join(tmp_dir, base + "_stereo.tif")
+
+    _gdal_based_save_array_to_disk(
+        wgs_tif,
+        xpx=xpx,
+        ypx=ypx,
+        px_sz=px_sz,
+        minx=minx,
+        maxy=maxy,
+        crs=crs,
+        crs_format=crs_format,
+        array_to_save=sliced_arr,
+    )
+
+    # --- 3) gdalwarp with the SAME options as the old script ---
+
+    if hemisphere == "NH":
         t_srs = f'+proj=stere +lat_0=90 +lat_ts={lat_ts_nh} +lon_0=0 +datum=WGS84'
     else:
-        mask = y_vec <= lat_thresh
         t_srs = f'+proj=stere +lat_0=-90 +lat_ts={lat_ts_sh} +lon_0=0 +datum=WGS84'
 
-    sliced = arr[mask, :]
-    y_vec_sliced = y_vec[mask]
+    gdalwarp_cmd = (
+        'gdalwarp -dstnodata nan -wo NUM_THREADS=1 '
+        f'-t_srs "{t_srs}" '
+        '-r near '
+        f'{wgs_tif} {stereo_tif}'
+    )
+    subprocess.run(gdalwarp_cmd, shell=True, stdout=subprocess.DEVNULL, check=True)
 
-    # Replace NaNs with nodata so GDAL handles it reliably
-    sliced = np.where(np.isfinite(sliced), sliced, nodata).astype("float32", copy=False)
+    # --- 4) Read polar raster and build xarray.DataArray with x/y coords ---
 
-    # Keep your convention (don’t overthink x_min/x_max)
-    px_sz = float(grid_resolution)
-    minx = float(np.min(x_vec) + grid_resolution / 2.0)
-    maxy = float(np.max(y_vec_sliced) - grid_resolution / 2.0)
+    with rasterio.open(stereo_tif) as src:
+        data = src.read(1).astype("float32")
+        transform = src.transform
 
-    if tmp_root is None:
-        tmp_root = os.environ.get("TMPDIR", "/tmp")
+        dx = transform.a
+        dy = transform.e
+        x0 = transform.c
+        y0 = transform.f
 
-    env = os.environ.copy()
-    env.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+        height, width = data.shape
+        x = x0 + dx * np.arange(width)
+        y = y0 + dy * np.arange(height)
 
-    with tempfile.TemporaryDirectory(dir=tmp_root) as tmp_dir:
-        wgs_tif = os.path.join(tmp_dir, f"{tag}_{hemisphere.lower()}_wgs.tif")
-        stereo_tif = os.path.join(tmp_dir, f"{tag}_{hemisphere.lower()}_stereo.tif")
-
-        _save_geotiff_wgs(
-            wgs_tif,
-            sliced,
-            minx=minx,
-            maxy=maxy,
-            px_sz=px_sz,
-            nodata=nodata,
+        da = xr.DataArray(
+            data,
+            coords={
+                "y": y.astype("float64"),
+                "x": x.astype("float64"),
+            },
+            dims=("y", "x"),
+            name=tag,
+            attrs={"crs": src.crs.to_string() if src.crs is not None else ""},
         )
 
-        cmd = (
-            "gdalwarp -overwrite "
-            f"-srcnodata {nodata} -dstnodata {nodata} "
-            f"-t_srs \"{t_srs}\" "
-            "-r near "
-            "-co COMPRESS=LZW "
-            f"\"{wgs_tif}\" \"{stereo_tif}\""
-        )
-        p = subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            env=env,
-            check=False,
-        )
-        if p.returncode != 0:
-            raise RuntimeError(f"gdalwarp failed (return code {p.returncode}). Command:\n{cmd}")
+    # --- 5) Clean up temp files ---
 
-        with rasterio.open(stereo_tif) as src:
-            data = src.read(1).astype("float32", copy=False)
-            data = np.where(data == nodata, np.nan, data)
-
-            tr = src.transform
-            xs = tr.c + tr.a * np.arange(src.width)
-            ys = tr.f + tr.e * np.arange(src.height)
-
-            da = xr.DataArray(
-                data,
-                coords={"y": ys, "x": xs},
-                dims=("y", "x"),
-                attrs={"crs": src.crs.to_string()},
-            )
+    try:
+        os.remove(wgs_tif)
+    except OSError:
+        pass
+    try:
+        os.remove(stereo_tif)
+    except OSError:
+        pass
 
     return da
 
+from typing import Dict, Tuple
 
 def reproject_vars_wgs_to_polar(
     var_grids: Dict[str, np.ndarray],
@@ -207,50 +210,28 @@ def reproject_vars_wgs_to_polar(
     lat_thresh_sh: float,
     lat_ts_nh: float = 70.0,
     lat_ts_sh: float = -71.0,
-    nodata: float = -9999.0,
+    nodata: float = -9999.0,   # kept for API compatibility (not used internally)
     tmp_root: Optional[str] = None,
-    return_coords: bool = False,
-) -> Dict[str, Any]:
+) -> Dict:
     """
-    Reproject a dict of WGS grids -> polar stereographic for NH and SH.
+    Wrapper used by AVHRRProcessor.wgs_to_polar.
 
-    Parameters
-    ----------
-    var_grids : dict[str, np.ndarray]
-        Each array must be on the same WGS grid (lat, lon) matching y_vec/x_vec.
-    orbit_tag : str
-        Used in temp file naming.
-    lat_thresh_nh, lat_thresh_sh : float
-        Hemisphere thresholds (your original y_min logic).
-    return_coords : bool
-        If True, also return x/y coord vectors for NH/SH.
-
-    Returns
-    -------
-    dict
-        Always returns:
-          {
-            "NH": {var: (("y","x"), array2d), ...},
-            "SH": {var: (("y","x"), array2d), ...},
-          }
-
-        If return_coords=True, also includes:
-          {
-            "coords": {
-              "NH": {"x": x_coords_nh, "y": y_coords_nh},
-              "SH": {"x": x_coords_sh, "y": y_coords_sh},
-            }
-          }
+    Returns a dict with:
+      polar["NH"]      -> {var: (("y","x"), arr_nh)}
+      polar["SH"]      -> {var: (("y","x"), arr_sh)}
+      polar["coords"]  -> {"NH": {"x": x_nh, "y": y_nh},
+                           "SH": {"x": x_sh, "y": y_sh}}
+    matching expectations in write_polar_groups_netcdf.
     """
-    vars_nh: Dict[str, Tuple[Tuple[str, str], np.ndarray]] = {}
-    vars_sh: Dict[str, Tuple[Tuple[str, str], np.ndarray]] = {}
 
-    x_coords_nh = y_coords_nh = None
-    x_coords_sh = y_coords_sh = None
+    nh_vars: Dict[str, Tuple[Tuple[str, str], np.ndarray]] = {}
+    sh_vars: Dict[str, Tuple[Tuple[str, str], np.ndarray]] = {}
+
+    nh_x = nh_y = None
+    sh_x = sh_y = None
 
     for vname, grid in var_grids.items():
-        grid = grid.astype("float32", copy=False)
-
+        # NH
         da_nh = reproject_wgs_to_polar(
             grid,
             "NH",
@@ -260,15 +241,11 @@ def reproject_vars_wgs_to_polar(
             grid_resolution=grid_resolution,
             lat_ts_nh=lat_ts_nh,
             lat_ts_sh=lat_ts_sh,
-            nodata=nodata,
-            tag=f"{orbit_tag}_{vname}",
+            tag=vname,
             tmp_root=tmp_root,
         )
-        vars_nh[vname] = (("y", "x"), da_nh.values.astype("float32", copy=False))
-        if x_coords_nh is None:
-            x_coords_nh = da_nh["x"].values
-            y_coords_nh = da_nh["y"].values
 
+        # SH
         da_sh = reproject_wgs_to_polar(
             grid,
             "SH",
@@ -278,21 +255,27 @@ def reproject_vars_wgs_to_polar(
             grid_resolution=grid_resolution,
             lat_ts_nh=lat_ts_nh,
             lat_ts_sh=lat_ts_sh,
-            nodata=nodata,
-            tag=f"{orbit_tag}_{vname}",
+            tag=vname,
             tmp_root=tmp_root,
         )
-        vars_sh[vname] = (("y", "x"), da_sh.values.astype("float32", copy=False))
-        if x_coords_sh is None:
-            x_coords_sh = da_sh["x"].values
-            y_coords_sh = da_sh["y"].values
 
-    out: Dict[str, Any] = {"NH": vars_nh, "SH": vars_sh}
+        nh_vars[vname] = (("y", "x"), da_nh.values.astype("float32"))
+        sh_vars[vname] = (("y", "x"), da_sh.values.astype("float32"))
 
-    if return_coords:
-        out["coords"] = {
-            "NH": {"x": x_coords_nh, "y": y_coords_nh},
-            "SH": {"x": x_coords_sh, "y": y_coords_sh},
-        }
+        if nh_x is None:
+            nh_x = da_nh["x"].values.astype("float64")
+            nh_y = da_nh["y"].values.astype("float64")
+        if sh_x is None:
+            sh_x = da_sh["x"].values.astype("float64")
+            sh_y = da_sh["y"].values.astype("float64")
 
-    return out
+    polar = {
+        "NH": nh_vars,
+        "SH": sh_vars,
+        "coords": {
+            "NH": {"x": nh_x, "y": nh_y},
+            "SH": {"x": sh_x, "y": sh_y},
+        },
+    }
+
+    return polar
