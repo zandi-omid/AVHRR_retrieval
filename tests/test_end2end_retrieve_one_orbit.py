@@ -52,7 +52,8 @@ AVH_VARS = ["cloud_probability", "temp_11_0um_nom", "temp_12_0um_nom"]
 # retrieval output format:
 #   - "polar": write retrieved fields on polar grid (fastest, no reprojection)
 #   - "wgs":   reproject retrieved fields to lat/lon using your polar_to_wgs utilities
-OUT_GRID = "polar"   # change to "wgs" if you want
+# OUT_GRID = "polar"   # change to "wgs" if you want
+OUT_GRID = "wgs"   # change to "wgs" if you want
 
 # model checkpoint / loader (placeholder)
 CKPT_PATH = (

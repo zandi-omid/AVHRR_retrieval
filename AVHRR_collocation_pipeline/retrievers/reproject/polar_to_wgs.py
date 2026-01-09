@@ -135,7 +135,7 @@ def reproject_polar_to_wgs(
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
-            check=False,
+            check=True,
         )
 
         with rasterio.open(wgs_tif) as src:

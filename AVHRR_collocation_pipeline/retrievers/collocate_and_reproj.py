@@ -248,7 +248,7 @@ class AVHRRProcessor:
         # 3) Grid required DL inputs
         var_grids = self.build_var_grids(df, x_vec, y_vec, input_vars)
 
-        np.savez("/xdisk/behrangi/omidzandi/retrieved_maps/test/2010_new_var_grids_debug.npz", **var_grids)
+        # np.savez("/xdisk/behrangi/omidzandi/retrieved_maps/test/2010_new_var_grids_debug.npz", **var_grids)
 
         # 4) Reproject to polar (still returns the dict)
         polar = self.wgs_to_polar(var_grids, orbit_tag, x_vec, y_vec)
