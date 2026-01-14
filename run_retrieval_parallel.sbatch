@@ -23,7 +23,7 @@ echo "----------------------------------------------------------"
 source /home/u20/omidzandi/micromamba/etc/profile.d/mamba.sh
 micromamba activate retrieval
 
-cd /xdisk/behrangi/omidzandi/AVHRR-retrieval/AVHRR_collocation_pipeline
+cd /xdisk/behrangi/omidzandi/AVHRR-retrieval
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
@@ -41,6 +41,7 @@ export NCCL_SOCKET_IFNAME=^lo,docker0
 nvidia-smi || true
 echo "----------------------------------------------------------"
 
-srun --export=ALL python run_retrieval_parallel.py
+srun --export=ALL python AVHRR_collocation_pipeline/run_retrieval_parallel.py \
+    --config config/retrieve_config.toml
 
 echo "=========== JOB ENDED: $(date) ==========="

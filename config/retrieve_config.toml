@@ -12,7 +12,7 @@ lat_ts_nh = 70.0
 lat_ts_sh = -71.0
 
 [DL]
-checkpoint = "/xdisk/behrangi/omidzandi/DL_Simon_codes/avhrr_retrievals/checkpoints/AVHRR_efficient_net_v2.ckpt"
+checkpoint = "/xdisk/behrangi/omidzandi/DL_Simon_codes/avhrr_retrievals/checkpoints/AVHRR_efficient_net_v2_pt_1_45_poleward_SH_ERA5_multi_node_keep_all_fp32-v1.ckpt"
 tile_size = 1536
 overlap = 64
 
