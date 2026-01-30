@@ -28,6 +28,10 @@ from AVHRR_collocation_pipeline.retrievers.back_to_L2 import AVHRRBackToL2
 
 from pytorch_retrieve.architectures import load_model
 
+from AVHRR_collocation_pipeline.retrievers.limb_correction.lut_loader import load_limbcorr_assets
+
+limb_assets = load_limbcorr_assets("/xdisk/behrangi/omidzandi/AVHRR-retrieval/AVHRR_collocation_pipeline/retrievers/limb_correction")
+
 # ------------------------------------------------------------
 # Parse config
 # ------------------------------------------------------------
@@ -59,6 +63,8 @@ OVERLAP    = int(cfg["DL"]["overlap"])
 AVH_VARS      = cfg["input_vars"]["avh_vars"]
 MERRA2_VARS   = cfg["input_vars"]["merra2_vars"]
 INPUT_VARS    = cfg["input_vars"]["dl_inputs"]
+
+DO_LIMB_CORRECTION = cfg.get("limb_correction", {}).get("do_limb_correction", False)
 
 OUT_GRID = cfg["output"]["grid"].lower()  # "wgs" or "polar"
 if OUT_GRID not in ("wgs", "polar"):
@@ -310,7 +316,8 @@ def gpu_stage_for_orbit(
         avh_vars=AVH_VARS,
         input_vars=INPUT_VARS,
         merra2_vars=MERRA2_VARS,
-        # out_polar_nc=BASE_OUT / f"{orbit_tag}_polar_inputs.nc",
+        do_limb_correction=DO_LIMB_CORRECTION,
+        out_polar_nc="/xdisk/behrangi/omidzandi/retrieved_maps/2010_test/collocated_polar"
     )
 
     ds_nh_polar = ds_polar["NH"]
@@ -433,6 +440,7 @@ def main():
         nodata=-9999.0,
         merra2_meta=merra2_meta,
         autosnow_meta=autosnow_meta,
+        limb_assets=limb_assets,
     )
 
     # ---------- CPU thread pool for finalization ---------- #

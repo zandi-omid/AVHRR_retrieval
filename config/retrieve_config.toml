@@ -36,3 +36,6 @@ write_vars_sh = ["retrieved_precip_q70"]
 # value = output variable name
 rename_vars_nh = { retrieved_precip_q80 = "retrieved" }
 rename_vars_sh = { retrieved_precip_q70 = "retrieved" }
+
+[limb_correction]
+do_limb_correction = false

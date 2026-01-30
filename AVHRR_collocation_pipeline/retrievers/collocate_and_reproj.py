@@ -5,14 +5,20 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import xarray as xr
+import pandas as pd
 
 # --- readers ---
 from AVHRR_collocation_pipeline.readers.AVHRR_reader import read_AVHRR_orbit_to_df
 from AVHRR_collocation_pipeline.readers.MERRA2_reader import collocate_MERRA2, MissingMERRA2File
 from AVHRR_collocation_pipeline.readers.AutoSnow_reader import collocate_AutoSnow
 
+from AVHRR_collocation_pipeline.retrievers.back_to_L2 import AVHRRBackToL2
+
 # --- reprojection (new location) ---
 from AVHRR_collocation_pipeline.retrievers.reproject import reproject_vars_wgs_to_polar
+
+# --- limb corrector
+from AVHRR_collocation_pipeline.retrievers.limb_stage import AVHRRLimbCorrectionStage
 
 # --- netcdf encoding (for 1 file with NH/SH groups) ---
 from AVHRR_collocation_pipeline.retrievers.netcdf_encoding import build_uint16_encoding
@@ -20,7 +26,8 @@ from AVHRR_collocation_pipeline.retrievers.netcdf_encoding import build_uint16_e
 # --- utils ---
 import AVHRR_collocation_pipeline.utils as utils
 
-import matplotlib.pyplot as plt
+from retrievers.limb_correction import correct_dataset_vectorized
+
 
 class AVHRRProcessor:
     """
@@ -46,6 +53,7 @@ class AVHRRProcessor:
         nodata: float = -9999.0,
         merra2_meta=None,
         autosnow_meta=None,
+        limb_assets,
     ):
         self.grid_res = float(grid_res)
         self.lat_thresh_nh = float(lat_thresh_nh)
@@ -56,6 +64,10 @@ class AVHRRProcessor:
 
         self.merra2_meta = merra2_meta
         self.autosnow_meta = autosnow_meta
+        self.limb_assets = limb_assets
+        self.limb_stage = AVHRRLimbCorrectionStage(lat_thresh_nh=self.lat_thresh_nh,
+                                                    lat_thresh_sh=self.lat_thresh_sh,
+                                                    assets=self.limb_assets)
 
     # --------------------------------------------------------
     # 1) Read orbit to DataFrame
@@ -224,84 +236,116 @@ class AVHRRProcessor:
         out_polar_nc: Optional[str | Path] = None,
         encoding_scales: Optional[Dict[str, float]] = None,
         default_scale: float = 0.005,
+        do_limb_correction: bool = True,
+
     ):
         """
         Full Stage-1 pipeline for a single AVHRR orbit.
 
-        Returns
-        -------
-        polar : dict
-            Same structure as reproject_vars_wgs_to_polar(..., return_coords=True)
+        If do_limb_correction=False:
+      - skips land_class->swath + limb correction
+      - uses original TB grids from df (temp_11_0um_nom, temp_12_0um_nom)
 
-        If out_polar_nc is provided, also writes ONE netcdf file with groups NH/SH.
+        New flow:
+        1) Read orbit -> df (gridded WGS, no MERRA2 yet)
+        2) AutoSnow only -> grid AutoSnow -> attach land_class to swath (in-memory)
+        3) Limb-correct TB11/TB12 on swath (in-memory)
+        4) Collocate MERRA2 on df (still WGS grid-level)
+        5) Build WGS var_grids for DL inputs, but REPLACE TB11/TB12 grids with corrected ones from swath
+        6) Reproject WGS -> polar (NH/SH), return ds_nh/ds_sh + tb11_wgs (+ x_vec/y_vec)
+
+        Returns:
+        {"NH": ds_nh, "SH": ds_sh}, tb11_wgs, x_vec, y_vec
         """
-        # 1) Read AVHRR orbit
+        # --------------------------------------------------------
+        # 1) Read orbit to df (WGS-gridded) + grid vectors
+        # --------------------------------------------------------
         df, x_vec, y_vec = self.load_orbit_df(avh_file, avh_vars)
         if df is None:
             return None
 
         orbit_tag = Path(avh_file).stem
 
-        # 2) Collocate DL features (no IMERG/ERA5)
+        # --------------------------------------------------------
+        # 2) AutoSnow only (to build land_class on WGS grid)
+        # --------------------------------------------------------
         df = self.collocate_dl_features(df, merra2_vars=merra2_vars, orbit_tag=orbit_tag)
 
-        # 3) Grid required DL inputs
-        var_grids = self.build_var_grids(df, x_vec, y_vec, input_vars)
 
-        def plot_var_grids(var_grids, x_vec, y_vec, title_prefix=""):
-            n = len(var_grids)
-            ncols = 3
-            nrows = int(np.ceil(n / ncols))
-
-            fig, axes = plt.subplots(
-                nrows, ncols,
-                figsize=(5 * ncols, 4 * nrows),
-                squeeze=False
+        # If limb correction is ON and AutoSnow is required, fail fast
+        if do_limb_correction and ("AutoSnow" in input_vars) and ("AutoSnow" not in df.columns):
+            raise KeyError(
+                "AutoSnow collocation failed: 'AutoSnow' column not created. "
+                "Check date_col (scan_date) exists and autosnow_meta is valid."
             )
 
-            for ax, (name, grid) in zip(axes.flat, var_grids.items()):
-                im = ax.imshow(
-                    grid,
-                    origin="upper",
-                    extent=[x_vec.min(), x_vec.max(), y_vec.min(), y_vec.max()],
-                    cmap="turbo"
-                )
-                ax.set_title(f"{title_prefix}{name}")
-                plt.colorbar(im, ax=ax, fraction=0.046)
+        # --------------------------------------------------------
+        # 3) Build WGS grids for DL inputs (excluding TBs for now)
+        # --------------------------------------------------------
+        base_vars = [v for v in input_vars if v not in ["temp_11_0um_nom", "temp_12_0um_nom"]]
+        var_grids = self.build_var_grids(df, x_vec, y_vec, base_vars)
 
-                nan_frac = np.isnan(grid).mean()
-                ax.text(
-                    0.01, 0.01,
-                    f"NaN frac: {nan_frac:.2f}",
-                    transform=ax.transAxes,
-                    fontsize=9,
-                    color="white",
-                    bbox=dict(facecolor="black", alpha=0.6),
-                )
 
-            # Hide unused axes
-            for ax in axes.flat[n:]:
-                ax.set_visible(False)
+        # --------------------------------------------------------
+        # 4) Optionally limb-correct TB11/TB12 on swath, then grid back to WGS
+        # --------------------------------------------------------
+        if do_limb_correction:
+            autosnow_grid = self.build_var_grids(df, x_vec, y_vec, ["AutoSnow"])["AutoSnow"]
 
-            plt.tight_layout()
-            plt.show()
-        
-        plot_var_grids(
-            var_grids,
-            x_vec,
-            y_vec,
-            title_prefix="WGS: "
-        )
+            if np.isnan(autosnow_grid).all():
+                raise ValueError("AutoSnow grid is all-NaN (dates mismatch? on_grid=0? missing tifs?)")
 
-        # extract TB11 WGS grid
+            limb_stage = AVHRRLimbCorrectionStage(
+                lat_thresh_nh=self.lat_thresh_nh,
+                lat_thresh_sh=self.lat_thresh_sh,
+                assets=self.limb_assets,
+            )
+
+            swath_ds = limb_stage.build_swath_ds_for_limb_correction(
+                raw_orbit_path=avh_file,
+                x_vec=x_vec,
+                y_vec=y_vec,
+                land_class_grid=autosnow_grid,
+            )
+
+            swath_ds = correct_dataset_vectorized(
+                swath_ds,
+                orbit_name=Path(avh_file).name,
+                assets=self.limb_assets,
+            )
+
+            for v in ("temp_11_0um_nom_corrected", "temp_12_0um_nom_corrected"):
+                if v not in swath_ds:
+                    raise KeyError(f"Limb correction did not produce '{v}'")
+
+            tb11_corr_grid = utils.grid_swath_var_mean(swath_ds, "temp_11_0um_nom_corrected", x_vec, y_vec)
+            tb12_corr_grid = utils.grid_swath_var_mean(swath_ds, "temp_12_0um_nom_corrected", x_vec, y_vec)
+
+            var_grids["temp_11_0um_nom"] = tb11_corr_grid.astype("float32")
+            var_grids["temp_12_0um_nom"] = tb12_corr_grid.astype("float32")
+
+        else:
+            # No limb correction: just grid the raw TBs from df
+            # (Only if the model expects them in input_vars)
+            if "temp_11_0um_nom" in input_vars:
+                if "temp_11_0um_nom" not in df.columns:
+                    raise KeyError("temp_11_0um_nom is required but missing in df")
+                var_grids["temp_11_0um_nom"] = self.build_var_grids(df, x_vec, y_vec, ["temp_11_0um_nom"])["temp_11_0um_nom"].astype("float32")
+
+            if "temp_12_0um_nom" in input_vars:
+                if "temp_12_0um_nom" not in df.columns:
+                    raise KeyError("temp_12_0um_nom is required but missing in df")
+                var_grids["temp_12_0um_nom"] = self.build_var_grids(df, x_vec, y_vec, ["temp_12_0um_nom"])["temp_12_0um_nom"].astype("float32")
+
+        # 5) TB11 WGS grid used later for masking coverage
         tb11_wgs = var_grids["temp_11_0um_nom"].astype("float32")
 
-        # np.savez("/xdisk/behrangi/omidzandi/retrieved_maps/test/2010_new_var_grids_debug.npz", **var_grids)
-
-        # 4) Reproject to polar (still returns the dict)
+        # --------------------------------------------------------
+        # 6) Reproject to polar (NH/SH)
+        # --------------------------------------------------------
         polar = self.wgs_to_polar(var_grids, orbit_tag, x_vec, y_vec)
 
-        # 5) Optionally write ONE polar NetCDF with NH/SH groups (no change)
+        # Optional write
         if out_polar_nc is not None:
             self.write_polar_groups_netcdf(
                 polar=polar,
@@ -310,9 +354,8 @@ class AVHRRProcessor:
                 default_scale=default_scale,
             )
 
-        # 6) Build in-memory datasets for NH / SH and return those
+        # Build in-memory datasets
         ds_nh = self._polar_to_dataset(polar, "NH")
         ds_sh = self._polar_to_dataset(polar, "SH")
 
-        # You can return a dict or a tuple; I'll use a dict:
         return {"NH": ds_nh, "SH": ds_sh}, tb11_wgs, x_vec, y_vec
