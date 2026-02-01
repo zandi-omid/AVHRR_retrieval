@@ -18,6 +18,8 @@ import pandas as pd
 import datetime
 from typing import Tuple, Dict, List
 from netCDF4 import Dataset
+import calendar
+
 
 import AVHRR_collocation_pipeline.utils as utils
 
@@ -118,35 +120,26 @@ def _fix_scanline_wraparound(
 # ---------------------------------------------------------------------
 # 4. Convert scan_line_time hours → UNIX timestamps
 # ---------------------------------------------------------------------
-def _convert_scanline_to_unix(
-    slt: np.ndarray,
-    base_dt: datetime.datetime
-) -> np.ndarray:
-    """
-    Convert scan_line_time (hours since 00:00) into UNIX timestamps.
-    Keeps NaNs and preserves 1D shape.
+def _convert_scanline_to_unix(slt: np.ndarray, base_dt: datetime.datetime) -> np.ndarray:
+    slt = slt.astype("float64")
+    ts_out = np.full_like(slt, np.nan, dtype="float64")
 
-    Returns
-    -------
-    ts_out : 1D array (float)
-    """
-    ts_out = np.full_like(slt, np.nan, dtype=float)
-    valid = ~np.isnan(slt)
+    valid = np.isfinite(slt)
+    if not valid.any():
+        return ts_out
 
-    if valid.any():
-        valid_hours = slt[valid]
-        ts_out[valid] = [
-            int((base_dt + datetime.timedelta(hours=float(h))).timestamp())
-            for h in valid_hours
-        ]
+    # UTC midnight epoch
+    if base_dt.tzinfo is None:
+        # treat as UTC (explicit)
+        base_dt = base_dt.replace(tzinfo=datetime.timezone.utc)
+    base_epoch = calendar.timegm(base_dt.timetuple())
 
+    ts_out[valid] = base_epoch + slt[valid] * 3600.0
     return ts_out
-
 
 # ---------------------------------------------------------------------
 # 5. Read requested AVHRR variables
 # ---------------------------------------------------------------------
-
 
 
 def _read_AVHRR_variables(

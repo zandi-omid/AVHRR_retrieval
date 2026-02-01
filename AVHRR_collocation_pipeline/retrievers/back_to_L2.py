@@ -95,51 +95,25 @@ class AVHRRBackToL2:
 
         return global_vars
 
-    # ------------------------------------------------------------------
-    # Public method: attach retrieval to L2 orbit
-    # ------------------------------------------------------------------
-    def attach_to_orbit(
+    def attach_to_orbit_ds(
         self,
         raw_orbit_path: Path | str,
         ds_nh: xr.Dataset,
         ds_sh: xr.Dataset,
-        out_path: Path | str,
-    ) -> Path:
-        """
-        Read the original L2 orbit, sample retrievals from ds_nh/ds_sh
-        onto the swath grid, and write a new L2-like file containing:
-
-        - latitude, longitude
-        - scan_line_time
-        - temp_11_0um_nom
-        - temp_12_0um_nom
-        - self.retrieved_var_names
-
-        All 2D vars end up with shape:
-        (scan_lines_along_track_direction, pixel_elements_along_scan_direction)
-
-        Many values will be NaN where the retrieval has no coverage
-        (e.g., outside ±45° poleward domain).
-        """
+        copy_vars_from_raw: list[str] | None = None,
+    ) -> xr.Dataset:
         raw_orbit_path = Path(raw_orbit_path)
-        out_path = Path(out_path)
-
-        # ----------------- 1. open original orbit -----------------
         ds_raw = xr.open_dataset(raw_orbit_path, decode_timedelta=True)
+
+        copy_vars_from_raw = copy_vars_from_raw or []
 
         line_dim = self.line_dim
         pix_dim = self.pix_dim
 
-        lat_raw = ds_raw["latitude"]   # (lines, pixels)
-        lon_raw = ds_raw["longitude"]  # (lines, pixels)
+        lat_raw = ds_raw["latitude"]
+        lon_raw = ds_raw["longitude"]
 
-        # ----------------- 2. merge NH+SH into global WGS grid -----------------
-        global_grids = self._merge_hemispheric_grids(ds_nh, ds_sh, self.retrieved_var_names)
-
-        # ----------------- 3. build new L2-style dataset -----------------
         out = xr.Dataset()
-
-        # Keep latitude/longitude as coordinates on swath grid
         out = out.assign_coords(
             {
                 line_dim: lat_raw.coords[line_dim] if line_dim in lat_raw.coords else range(ds_raw.sizes[line_dim]),
@@ -149,33 +123,28 @@ class AVHRRBackToL2:
             }
         )
 
-        # Keep the time + TBs (values copied 1:1)
-        if "scan_line_time" in ds_raw:
-            out["scan_line_time"] = ds_raw["scan_line_time"]
+        # Always keep time/TBs if present (your current behavior)
 
-        if "temp_11_0um_nom" in ds_raw:
-            out["temp_11_0um_nom"] = ds_raw["temp_11_0um_nom"]
+        out["scan_line_time"] = ds_raw["scan_line_time"]
+        out["temp_11_0um_nom"] = ds_raw["temp_11_0um_nom"]
+        out["temp_12_0um_nom"] = ds_raw["temp_12_0um_nom"]
 
-        if "temp_12_0um_nom" in ds_raw:
-            out["temp_12_0um_nom"] = ds_raw["temp_12_0um_nom"]
+        # copy additional raw vars needed by limb correction (e.g., cloud_probability)
+        for v in copy_vars_from_raw:
+            if v in ds_raw:
+                out[v] = ds_raw[v]
+            else:
+                print(f"[WARN] raw orbit missing '{v}' — limb correction may fail.", flush=True)
 
-        # ----------------- 4. interpolate retrievals to swath coords -----------------
+        # Merge gridded land_class (or retrieval vars) onto swath grid
+        global_grids = self._merge_hemispheric_grids(ds_nh, ds_sh, self.retrieved_var_names)
+
         for v in self.retrieved_var_names:
             if v not in global_grids:
-                print(f"[WARN] Retrieval variable '{v}' not found in merged global grids — skipping.")
                 continue
-
             da_global = global_grids[v]
+            da_on_swath = da_global.interp(y=lat_raw, x=lon_raw, method="nearest")
 
-            # da_global has dims (y, x) with coordinates y,x in degrees
-            # lat_raw, lon_raw have dims (line_dim, pix_dim) in degrees
-            da_on_swath = da_global.interp(
-                y=lat_raw,
-                x=lon_raw,
-                method="nearest",
-            )
-
-            # Ensure dims names match the swath names
             rename_map = {}
             if len(da_on_swath.dims) == 2:
                 d0, d1 = da_on_swath.dims
@@ -183,43 +152,35 @@ class AVHRRBackToL2:
                     rename_map[d0] = line_dim
                 if d1 != pix_dim:
                     rename_map[d1] = pix_dim
-
             if rename_map:
                 da_on_swath = da_on_swath.rename(rename_map)
 
             da_on_swath.attrs["coordinates"] = "latitude longitude"
-
             out[v] = da_on_swath
 
-        # ----------------- 5. set attrs & encoding -----------------
-        # Global attrs: copy original, then add a comment
-        out.attrs.update(ds_raw.attrs)
-        out.attrs.update(
-            {
-                "source_orbit_file": str(raw_orbit_path),
-                "comment": "AVHRR orbit with attached retrieved precipitation fields on swath grid.",
-            }
-        )
-
-        # Build encoding:
-        #  - reuse original encoding for scan_line_time, temp_11, temp_12
-        #  - apply packed encoding only to retrieved precip vars
-        encoding: Dict[str, dict] = {}
-
-        # retrieved fields: write as plain float32, no packing
-        for v in self.retrieved_var_names:
-            if v not in out:
-                continue
-            encoding[v] = {
-                "dtype": "float32",
-                "_FillValue": float('nan'),
-                "zlib": True,
-                "complevel": 4,
-            }
-
-        # ----------------- 6. write to NetCDF -----------------
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out.to_netcdf(out_path, format="NETCDF4", encoding=encoding)
-
         ds_raw.close()
+        return out
+
+    def attach_to_orbit(
+        self,
+        raw_orbit_path: Path | str,
+        ds_nh: xr.Dataset,
+        ds_sh: xr.Dataset,
+        out_path: Path | str,
+    ) -> Path:
+        out_path = Path(out_path)
+        out_ds = self.attach_to_orbit_ds(raw_orbit_path, ds_nh, ds_sh)
+
+        encoding = {}
+        for v in self.retrieved_var_names:
+            if v in out_ds:
+                encoding[v] = {
+                    "dtype": "float32",
+                    "_FillValue": float("nan"),
+                    "zlib": True,
+                    "complevel": 4,
+                }
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_ds.to_netcdf(out_path, format="NETCDF4", encoding=encoding)
         return out_path

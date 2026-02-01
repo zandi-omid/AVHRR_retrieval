@@ -65,7 +65,7 @@ def reproject_polar_to_wgs(
     grid_resolution_deg: float,
     lat_ts_nh: float = 70.0,
     lat_ts_sh: float = -71.0,
-    resampling: str = "avg",
+    resampling: str = "near",
     nodata: float = np.nan,
     tag: str = "polar2wgs",
     tmp_root: Optional[str] = None,

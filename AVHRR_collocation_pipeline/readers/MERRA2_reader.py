@@ -30,8 +30,8 @@ def collocate_MERRA2(
     MERRA2_vars: List[str],
     *, 
     orbit_tag: str | None = None,
-    hour_col: str = "scan_hour",
-    date_col: str = "scan_date",
+    hour_col: str = "scan_hour_m2",
+    date_col: str = "scan_date_m2",
     debug: bool = False,
 ):
     """

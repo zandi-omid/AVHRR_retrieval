@@ -1,8 +1,10 @@
 [paths]
-avhrr_dirs = ["/xdisk/behrangi/omidzandi/DL_Simon_chips/input_raw_data/AVHRR/2019_subset"]
+avhrr_dirs = ["/xdisk/behrangi/omidzandi/DL_Simon_chips/input_raw_data/AVHRR/2010_subset"]
 merra2_dir = "/xdisk/behrangi/omidzandi/DL_Simon_chips/input_raw_data/MERRA2/merra2_archive_19800101_20250831"
 autosnow_dir = "/xdisk/behrangi/omidzandi/DL_Simon_chips/input_raw_data/AutoSnow/autosnow_in_geotif"
-out_dir = "/xdisk/behrangi/omidzandi/retrieved_maps/2019_test"
+out_dir = "/xdisk/behrangi/omidzandi/retrieved_maps/2010"
+collocated_polar_dir = "/xdisk/behrangi/omidzandi/retrieved_maps/2010_test/collocated_polar"
+
 
 [grid]
 resolution_deg = 0.25
@@ -24,8 +26,10 @@ dl_inputs = ["cloud_probability", "temp_11_0um_nom", "temp_12_0um_nom", "TQV", "
 [output]
 grid = "wgs"   # "wgs" or "polar"
 
-# Whether we want to export the retrieved percipitation in WGS to nc file or not.
-enable_wgs_output = false   # True or false
+# Whether we want to export the retrieved percipitation in WGS to nc file or not (applying no back2L2!).
+enable_wgs_output = false   # true or false 
+# !!!!!!!!NOTE: if you set this variable (enable_wgs_output) true, you must set the grid variable to wgs as well!
+
 
 # Which retrieved vars to write
 write_vars_nh = ["retrieved_precip_q80"]

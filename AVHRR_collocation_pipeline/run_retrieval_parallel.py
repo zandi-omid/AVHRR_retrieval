@@ -37,9 +37,15 @@ limb_assets = load_limbcorr_assets("/xdisk/behrangi/omidzandi/AVHRR-retrieval/AV
 # ------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, default="config/retrieve_config.toml")
+parser.add_argument(
+    "--stage1-only",
+    action="store_true",
+    help="Run only (collocation + reprojection). Skip retrieval + writing.",
+)
 args = parser.parse_args()
 cfg = toml.load(args.config)
 
+STAGE1_ONLY = args.stage1_only
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
@@ -49,6 +55,9 @@ AUTOSNOW_DIR   = cfg["paths"]["autosnow_dir"]
 
 BASE_OUT = Path(cfg["paths"]["out_dir"])
 BASE_OUT.mkdir(parents=True, exist_ok=True)
+
+COLLOC_POLAR_DIR = Path(cfg["paths"]["collocated_polar_dir"])
+COLLOC_POLAR_DIR.mkdir(parents=True, exist_ok=True)
 
 GRID_RES     = float(cfg["grid"]["resolution_deg"])
 LAT_THRESH_NH = float(cfg["grid"]["lat_thresh_nh"])
@@ -296,6 +305,8 @@ def gpu_stage_for_orbit(
     retriever: AVHRRHybridRetriever,
     merra2_meta,
     autosnow_meta,
+    *,
+    stage1_only: bool = False,
 ):
     """
     Does:
@@ -310,6 +321,9 @@ def gpu_stage_for_orbit(
     """
     orbit_tag = extract_orbit_tag(avh_file)
 
+    out_polar_nc = COLLOC_POLAR_DIR / f"{orbit_tag}_collocated_polar.nc"
+
+
     # --- Stage-1: collocate + WGS->polar --- #
     ds_polar, tb11_wgs, x_vec_global, y_vec_global = processor.process_orbit(
         avh_file=avh_file,
@@ -317,8 +331,14 @@ def gpu_stage_for_orbit(
         input_vars=INPUT_VARS,
         merra2_vars=MERRA2_VARS,
         do_limb_correction=DO_LIMB_CORRECTION,
-        out_polar_nc="/xdisk/behrangi/omidzandi/retrieved_maps/2010_test/collocated_polar"
+        out_polar_nc=out_polar_nc,
     )
+
+    if stage1_only:
+        return {
+            "orbit_tag": orbit_tag,
+            "stage1_only": True,
+        }
 
     ds_nh_polar = ds_polar["NH"]
     ds_sh_polar = ds_polar["SH"]
@@ -477,7 +497,12 @@ def main():
                 retriever=retriever,
                 merra2_meta=merra2_meta,
                 autosnow_meta=autosnow_meta,
+                stage1_only=STAGE1_ONLY,
             )
+
+            if STAGE1_ONLY:
+                # Stage-1 done; skip GPU retrieval + CPU finalization
+                continue
 
             # ---------- CPU part: submit to threadpool ---------- #
             fut = writer_pool.submit(

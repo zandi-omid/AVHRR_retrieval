@@ -99,6 +99,11 @@ class AVHRRProcessor:
             return None, None, None
 
         df = utils.add_time_columns(df)
+
+        print(df["scan_hour"].value_counts().head())
+        print(df["scan_hour_hr"].value_counts().head())
+        print(df[["scan_dt","scan_hour","scan_date_hr","scan_hour_hr"]].head(10))
+
         return df, x_vec, y_vec
 
     # --------------------------------------------------------
@@ -119,7 +124,9 @@ class AVHRRProcessor:
         IMERG/ERA5 are intentionally removed from Stage-1.
         """
         if self.merra2_meta is not None and merra2_vars:
-            df = collocate_MERRA2(df, self.merra2_meta, MERRA2_vars=merra2_vars, orbit_tag=orbit_tag)
+            df = collocate_MERRA2(df, self.merra2_meta, MERRA2_vars=merra2_vars, orbit_tag=orbit_tag, date_col="scan_date_m2", hour_col="scan_hour_m2", debug=True)
+
+            df.to_pickle("____df_new" + orbit_tag + ".pkl")
 
         if self.autosnow_meta is not None:
             df = collocate_AutoSnow(df, self.autosnow_meta, date_col="scan_date", out_col="AutoSnow")
@@ -347,6 +354,7 @@ class AVHRRProcessor:
 
         # Optional write
         if out_polar_nc is not None:
+            print("writing to polar")
             self.write_polar_groups_netcdf(
                 polar=polar,
                 out_nc=Path(out_polar_nc),

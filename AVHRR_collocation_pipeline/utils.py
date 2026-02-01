@@ -95,6 +95,96 @@ def df2grid(
 
     return grid
 
+def grid_swath_var_mean(
+    swath_ds: xr.Dataset,
+    var_name: str,
+    x_vec: np.ndarray,
+    y_vec: np.ndarray,
+    *,
+    lat_name: str = "latitude",
+    lon_name: str = "longitude",
+) -> np.ndarray:
+    """
+    Grid a swath variable (on the AVHRR swath grid) to a regular WGS grid (y,x)
+    using mean aggregation per grid cell.
+
+    This is consistent with the normal of using utils.index_finder()
+    (x_vec ascending, y_vec descending).
+
+    Parameters
+    ----------
+    swath_ds : xr.Dataset
+        Dataset containing:
+          - lat_name: 2D latitude (lines, pixels)
+          - lon_name: 2D longitude (lines, pixels)
+          - var_name: 2D variable on same swath grid
+    var_name : str
+        Variable to grid (e.g., "temp_11_0um_nom_corrected").
+    x_vec, y_vec : np.ndarray
+        Target WGS grid vectors (lon centers ascending, lat centers descending).
+    lat_name, lon_name : str
+        Names of latitude/longitude variables in swath_ds.
+
+    Returns
+    -------
+    grid : np.ndarray
+        2D array with shape (len(y_vec), len(x_vec)) containing mean values.
+        Cells with no samples are NaN.
+    """
+    if lat_name not in swath_ds:
+        raise KeyError(f"swath_ds missing '{lat_name}'")
+    if lon_name not in swath_ds:
+        raise KeyError(f"swath_ds missing '{lon_name}'")
+    if var_name not in swath_ds:
+        raise KeyError(f"swath_ds missing '{var_name}'")
+
+    lat = np.asarray(swath_ds[lat_name].values)
+    lon = np.asarray(swath_ds[lon_name].values)
+    val = np.asarray(swath_ds[var_name].values)
+
+    # flatten
+    lat_f = lat.ravel()
+    lon_f = lon.ravel()
+    val_f = val.ravel()
+
+    # keep only finite samples
+    ok = np.isfinite(lat_f) & np.isfinite(lon_f) & np.isfinite(val_f)
+    if not np.any(ok):
+        # return all-NaN grid
+        return np.full((len(y_vec), len(x_vec)), np.nan, dtype=np.float32)
+
+    lat_f = lat_f[ok]
+    lon_f = lon_f[ok]
+    val_f = val_f[ok].astype(np.float64)
+
+    # map to grid indices using YOUR binning rules
+    ix, iy = index_finder(lon_f, lat_f, x_vec, y_vec)
+    on = (ix >= 0) & (iy >= 0)
+
+    if not np.any(on):
+        return np.full((len(y_vec), len(x_vec)), np.nan, dtype=np.float32)
+
+    ix = ix[on].astype(np.int64)
+    iy = iy[on].astype(np.int64)
+    val_f = val_f[on]
+
+    nx = len(x_vec)
+    ny = len(y_vec)
+
+    # flatten cell index
+    cell = iy * nx + ix
+    ncell = nx * ny
+
+    # sum + count per cell
+    s = np.bincount(cell, weights=val_f, minlength=ncell)
+    c = np.bincount(cell, minlength=ncell)
+
+    out = np.full(ncell, np.nan, dtype=np.float32)
+    m = np.divide(s, c, out=np.zeros_like(s), where=(c > 0))
+    out[c > 0] = m[c > 0].astype(np.float32)
+
+    return out.reshape((ny, nx))
+
 
 def save_grid_to_tiff(
     grid: np.ndarray,
@@ -300,45 +390,133 @@ def build_tiff_name(
 def add_time_columns(
     df: pd.DataFrame,
     time_col: str = "scan_line_times",
+    *,
     add_nearest_hour: bool = True,
     add_nearest_halfhour: bool = True,
+    round_ties: str = "half_even",  # choose "half_even" to better mimic pandas dt.round("h")
 ) -> pd.DataFrame:
     """
     Add standardized time columns to df once, for use by ALL collocators.
 
     Requires:
-      df[time_col] = UNIX seconds (int/float)
+      df[time_col] = UNIX seconds (int or float). Floats can occur after aggregation.
 
-    Adds:
-      - scan_dt               datetime64[s]
-      - scan_date             str "YYYY-MM-DD"
-      - scan_hour             int16 0..23
-      - scan_hour_unix        int64 UNIX sec (nearest hour)      [optional]
-      - scan_halfhour_unix    int64 UNIX sec (nearest 30-min)    [optional]
+    Adds (general):
+      - scan_unix             float64 original unix seconds (preserves fractions)
+      - scan_dt               datetime64[s] (floor to second, for display)
+      - scan_date             str "YYYY-MM-DD" (from scan_dt)
+      - scan_hour             int16 0..23 (from scan_dt)
+      - scan_hour_unix        int64 unix seconds of nearest hour (optional)
+      - scan_date_hr          str date from scan_hour_unix (optional)
+      - scan_hour_hr          int16 hour from scan_hour_unix (optional)
+      - scan_halfhour_unix    int64 unix seconds of nearest 30-min (optional)
+
+    Adds (OLD MERRA2-matching keys):
+      - scan_dt_round_h       datetime64[s] timestamp rounded to nearest hour
+                              (ties handled by round_ties; "half_even" mimics pandas better)
+      - scan_date_m2          str "YYYY-MM-DD" derived from scan_dt_round_h
+      - scan_hour_m2          int16 hour derived from scan_dt_round_h
+
+    Notes
+    -----
+    Old pipeline used:
+        scan_line_times_round = pd.to_datetime(scan_line_times, unit="s").dt.round("h")
+        scan_line_hours_int_no_1_hr = scan_line_times_round.dt.hour
+        scan_line_y-m-d = scan_line_times_round.strftime("%Y-%m-%d")
+
+    To match that as closely as possible WITHOUT pandas, use:
+        round_ties="half_even"  (banker's rounding at exact .5 hour)
     """
     out = df.copy()
 
-    t = out[time_col].to_numpy().astype("int64")
-    scan_dt = t.astype("datetime64[s]")          # seconds resolution
+    # Keep float to avoid truncation artifacts after groupby mean
+    t = out[time_col].to_numpy(dtype="float64")
+    out["scan_unix"] = t
 
-    # date + hour (vectorized)
+    # Display datetime (floored to second)
+    scan_dt = t.astype("datetime64[s]")
     day = scan_dt.astype("datetime64[D]")
+
     out["scan_dt"] = scan_dt
     out["scan_date"] = day.astype(str)
 
     hour = (scan_dt.astype("datetime64[h]") - day).astype("timedelta64[h]").astype(int)
     out["scan_hour"] = hour.astype(np.int16)
 
-    if add_nearest_hour:
-        # nearest hour: floor((t + 1800)/3600)*3600
-        out["scan_hour_unix"] = ((t + 1800) // 3600 * 3600).astype("int64")
+    # ------------------------------------------------------------
+    # OLD MERRA2-style: round to nearest hour (like pandas dt.round("h"))
+    # ------------------------------------------------------------
+    # We do rounding in float-space (seconds), then convert back to datetime64.
+    sec_per_hour = 3600.0
+    hours_float = t / sec_per_hour
+    base = np.floor(hours_float)           # integer hour index (float)
+    frac = hours_float - base              # fractional part in [0, 1) (or close)
 
+    down = base
+    up = base + 1.0
+
+    # Normal nearest-hour choice
+    choose_up = frac > 0.5
+    choose_down = frac < 0.5
+
+    # Ties at exactly 0.5 hour
+    tie = np.isclose(frac, 0.5)
+
+    if round_ties == "half_up":
+        # ties go UP
+        hour_index = np.where(choose_up | tie, up, down)
+    elif round_ties == "half_even":
+        # ties go to EVEN hour index (banker's rounding)
+        down_i = down.astype("int64")
+        even_down = (down_i % 2 == 0)
+        # if down is even -> stay down; else -> go up
+        tie_choose_up = tie & (~even_down)
+        hour_index = np.where(choose_up | tie_choose_up, up, down)
+    else:
+        raise ValueError("round_ties must be 'half_up' or 'half_even'")
+
+    # Convert rounded hour index back to unix seconds
+    hr_unix_round = (hour_index.astype("int64") * 3600).astype("int64")
+
+    # Old-style rounded datetime and keys
+    dt_round_h = hr_unix_round.astype("datetime64[s]")
+    day_round = dt_round_h.astype("datetime64[D]")
+
+    out["scan_dt_round_h"] = dt_round_h
+    out["scan_date_m2"] = day_round.astype(str)
+    out["scan_hour_m2"] = (
+        (dt_round_h.astype("datetime64[h]") - day_round)
+        .astype("timedelta64[h]")
+        .astype(int)
+        .astype(np.int16)
+    )
+
+    # ------------------------------------------------------------
+    # Nearest-hour unix (keep your existing outputs, but use the SAME rounding)
+    # so scan_date_hr/scan_hour_hr remain consistent and reproducible.
+    # ------------------------------------------------------------
+    if add_nearest_hour:
+        out["scan_hour_unix"] = hr_unix_round
+
+        dt_hr = dt_round_h
+        day_hr = day_round
+
+        out["scan_date_hr"] = day_hr.astype(str)
+        out["scan_hour_hr"] = (
+            (dt_hr.astype("datetime64[h]") - day_hr)
+            .astype("timedelta64[h]")
+            .astype(int)
+            .astype(np.int16)
+        )
+
+    # ------------------------------------------------------------
+    # Nearest half-hour unix
+    # ------------------------------------------------------------
     if add_nearest_halfhour:
-        # nearest 30 min: floor((t + 900)/1800)*1800
-        out["scan_halfhour_unix"] = ((t + 900) // 1800 * 1800).astype("int64")
+        hh_unix = (np.floor((t + 900.0) / 1800.0) * 1800.0).astype("int64")
+        out["scan_halfhour_unix"] = hh_unix
 
     return out
-
 
 
 def save_polar_netcdf(
