@@ -434,7 +434,8 @@ def add_time_columns(
     out["scan_unix"] = t
 
     # Display datetime (floored to second)
-    scan_dt = t.astype("datetime64[s]")
+    t_sec_floor = np.floor(t).astype("int64")
+    scan_dt = t_sec_floor.astype("datetime64[s]")
     day = scan_dt.astype("datetime64[D]")
 
     out["scan_dt"] = scan_dt
@@ -445,9 +446,9 @@ def add_time_columns(
 
     # ------------------------------------------------------------
     # OLD MERRA2-style: round to nearest hour (EXACT, float-safe)
-    # Matches pandas dt.round("h") when round_ties="half_even"
+    # # Match old pipeline: drop fractional seconds, don't round them
     # ------------------------------------------------------------
-    t_sec = np.round(t).astype("int64")  # snap to whole seconds first
+    t_sec = t_sec_floor  # snap to whole seconds first
     sec_in_hour = 3600
 
     rem = t_sec % sec_in_hour           # seconds past the hour

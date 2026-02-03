@@ -128,15 +128,21 @@ def _convert_scanline_to_unix(slt: np.ndarray, base_dt: datetime.datetime) -> np
     if not valid.any():
         return ts_out
 
-    # UTC midnight epoch
+    # Treat base_dt as UTC midnight (same intent as old code)
     if base_dt.tzinfo is None:
-        # treat as UTC (explicit)
         base_dt = base_dt.replace(tzinfo=datetime.timezone.utc)
-    base_epoch = calendar.timegm(base_dt.timetuple())
 
-    ts_out[valid] = base_epoch + slt[valid] * 3600.0
+    base_epoch = calendar.timegm(base_dt.timetuple())  # int seconds
+
+    # OLD behavior: int(timestamp()) => truncation to whole seconds
+    # Use floor to reproduce "01:29:59.999 -> 01:29:59"
+    ts = base_epoch + slt[valid] * 3600.0
+
+    # tiny epsilon helps when ts is like 5399.999999999 due to float rep
+    ts_int = np.floor(ts + 1e-9).astype("int64")
+
+    ts_out[valid] = ts_int.astype("float64")
     return ts_out
-
 # ---------------------------------------------------------------------
 # 5. Read requested AVHRR variables
 # ---------------------------------------------------------------------
