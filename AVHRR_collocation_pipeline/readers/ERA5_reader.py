@@ -10,37 +10,42 @@ def collocate_ERA5_precip(
     ERA5_meta_by_year,
     varname: str = "tp",
     out_col: str | None = None,
-    scale: float = 1000.0,      # tp: meters -> mm
-    time_offset_seconds: int = 0,  # <-- NEW: use +3600 to mimic OLD pipeline
+    scale: float = 1000.0,          # tp: meters -> mm
+    *,
+    time_key: str = "scan_hour_unix_era5",  # default mimics OLD
 ):
     """
     Collocate ERA5 hourly data (one file per year) to df.
 
-    Uses df['scan_hour_unix'] if present (recommended).
-    Otherwise falls back to nearest-hour rounding on scan_line_times.
+    Timing:
+      - Uses df['scan_hour_unix'] (nearest-hour unix, from add_time_columns)
+      - Then applies time_offset_seconds (DEFAULT +3600 to mimic OLD pipeline)
 
-    time_offset_seconds:
-        0      -> NEW behavior (nearest-hour)
-        +3600  -> OLD behavior (nearest-hour then +1 hour)
+    OLD pipeline behavior replicated:
+      - nearest-hour rounding + 1 hour shift
+      - mask -> NaN
+      - negative tp -> 0
     """
     if out_col is None:
         out_col = f"ERA5_{varname}"
 
     # -----------------------
-    # Time (nearest hour unix)
+    # Time (nearest-hour unix)
     # -----------------------
-    if "scan_hour_unix" in df.columns:
+    if time_key in df.columns:
+        t_hour = df[time_key].to_numpy().astype("int64")
+    elif "scan_hour_unix" in df.columns:
         t_hour = df["scan_hour_unix"].to_numpy().astype("int64")
     else:
         t = df["scan_line_times"].to_numpy().astype("int64")
         t_hour = ((t + 1800) // 3600) * 3600
 
-    # Apply optional offset (OLD pipeline used +1 hour for ERA5/IMERG)
-    if time_offset_seconds != 0:
-        t_hour = t_hour + np.int64(time_offset_seconds)
-
-    # Year per row (after offset!)
-    years = (t_hour.astype("datetime64[s]").astype("datetime64[Y]").astype(int) + 1970).astype(np.int32)
+    # Year per row (after offset)
+    years = (
+        t_hour.astype("datetime64[s]")
+        .astype("datetime64[Y]")
+        .astype(int) + 1970
+    ).astype(np.int32)
 
     # -----------------------
     # Spatial indices per row
@@ -56,6 +61,8 @@ def collocate_ERA5_precip(
             continue
 
         m_year = (years == yr)
+        if not np.any(m_year):
+            continue
 
         ix, iy = utils.index_finder(lon[m_year], lat[m_year], meta["lon"], meta["lat"])
         good_xy = (ix >= 0) & (iy >= 0)
@@ -68,6 +75,7 @@ def collocate_ERA5_precip(
         # Exact match on hourly unix
         t_sub = t_hour[m_year][good_xy]
         tidx = np.searchsorted(meta["time_unix"], t_sub, side="left")
+
         ok_t = (
             (tidx >= 0)
             & (tidx < len(meta["time_unix"]))
@@ -92,11 +100,19 @@ def collocate_ERA5_precip(
                 xs = ix2[mm]
                 ys = iy2[mm]
 
-                arr = var[int(t_unique), :, :]   # lon still 0..360
-                arr = arr[:, lon_sort]           # reorder to -180..180
-                vals = arr[ys, xs]
+                arr = var[int(t_unique), :, :]      # lon still 0..360 (maybe masked)
+                arr = arr[:, lon_sort]              # reorder to -180..180
 
-                out[rr] = (vals * scale).astype("float32")
+                # Handle masked arrays -> NaN
+                if np.ma.isMaskedArray(arr):
+                    arr = arr.filled(np.nan)
+
+                vals = arr[ys, xs]                  # float/ndarray
+                vals = (vals * scale).astype("float32")
+
+                vals = np.where(np.isfinite(vals) & (vals < 0), 0.0, vals)
+
+                out[rr] = vals
 
     df2 = df.copy()
     df2[out_col] = out

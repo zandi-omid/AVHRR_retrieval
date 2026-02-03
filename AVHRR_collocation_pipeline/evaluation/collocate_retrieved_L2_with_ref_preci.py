@@ -207,7 +207,11 @@ def process_one_orbit(l2_file_str: str) -> tuple[str, bool, str]:
             varname=era5_var,
             out_col=era5_outcol,
             scale=era5_scale,
+            time_key="scan_hour_unix_era5"
         )
+        
+        print("export df")
+        df.to_pickle("/scratch/omidzandi/evaluation/2010_collocated_with_ref_preci_test/___new_" + orbit_tag + "_df.pkl")
 
         # 5) grid to WGS
         grids = _df_to_wgs_grids(df, x_vec, y_vec, x, y, grid_vars)
@@ -284,10 +288,10 @@ def main():
             orbit_tag, success, msg = fut.result()
             if success:
                 ok += 1
-                # print(f"[OK]   {orbit_tag} -> {msg}", flush=True)
+                print(f"[OK]   {orbit_tag} -> {msg}", flush=True)
             else:
                 bad += 1
-                # print(f"[FAIL] {orbit_tag}\n{msg}", flush=True)
+                print(f"[FAIL] {orbit_tag}\n{msg}", flush=True)
 
     print(f"\n[SUMMARY] OK={ok}, FAIL={bad}, TOTAL={len(files)}", flush=True)
 

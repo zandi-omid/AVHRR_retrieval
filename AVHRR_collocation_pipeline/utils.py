@@ -444,40 +444,32 @@ def add_time_columns(
     out["scan_hour"] = hour.astype(np.int16)
 
     # ------------------------------------------------------------
-    # OLD MERRA2-style: round to nearest hour (like pandas dt.round("h"))
+    # OLD MERRA2-style: round to nearest hour (EXACT, float-safe)
+    # Matches pandas dt.round("h") when round_ties="half_even"
     # ------------------------------------------------------------
-    # We do rounding in float-space (seconds), then convert back to datetime64.
-    sec_per_hour = 3600.0
-    hours_float = t / sec_per_hour
-    base = np.floor(hours_float)           # integer hour index (float)
-    frac = hours_float - base              # fractional part in [0, 1) (or close)
+    t_sec = np.round(t).astype("int64")  # snap to whole seconds first
+    sec_in_hour = 3600
 
-    down = base
-    up = base + 1.0
+    rem = t_sec % sec_in_hour           # seconds past the hour
+    down = t_sec - rem                  # lower hour boundary (unix sec)
+    up = down + sec_in_hour             # upper hour boundary
 
-    # Normal nearest-hour choice
-    choose_up = frac > 0.5
-    choose_down = frac < 0.5
-
-    # Ties at exactly 0.5 hour
-    tie = np.isclose(frac, 0.5)
+    # nearest-hour decision
+    choose_up = rem > (sec_in_hour // 2)        # > 1800
+    choose_down = rem < (sec_in_hour // 2)      # < 1800
+    tie = rem == (sec_in_hour // 2)             # exactly 1800 sec
 
     if round_ties == "half_up":
-        # ties go UP
-        hour_index = np.where(choose_up | tie, up, down)
+        hr_unix_round = np.where(choose_up | tie, up, down).astype("int64")
     elif round_ties == "half_even":
-        # ties go to EVEN hour index (banker's rounding)
-        down_i = down.astype("int64")
-        even_down = (down_i % 2 == 0)
-        # if down is even -> stay down; else -> go up
+        # banker's rounding: ties go to EVEN hour index
+        down_hour_index = (down // sec_in_hour).astype("int64")
+        even_down = (down_hour_index % 2 == 0)
         tie_choose_up = tie & (~even_down)
-        hour_index = np.where(choose_up | tie_choose_up, up, down)
+        hr_unix_round = np.where(choose_up | tie_choose_up, up, down).astype("int64")
     else:
         raise ValueError("round_ties must be 'half_up' or 'half_even'")
-
-    # Convert rounded hour index back to unix seconds
-    hr_unix_round = (hour_index.astype("int64") * 3600).astype("int64")
-
+    
     # Old-style rounded datetime and keys
     dt_round_h = hr_unix_round.astype("datetime64[s]")
     day_round = dt_round_h.astype("datetime64[D]")
@@ -508,6 +500,8 @@ def add_time_columns(
             .astype(int)
             .astype(np.int16)
         )
+
+        out["scan_hour_unix_era5"] = (hr_unix_round + 3600).astype("int64")
 
     # ------------------------------------------------------------
     # Nearest half-hour unix
