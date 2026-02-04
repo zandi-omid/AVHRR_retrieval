@@ -193,8 +193,10 @@ def process_one_orbit(l2_file_str: str) -> tuple[str, bool, str]:
             lat_thresh_S_hemisphere=lat_thresh_sh,
         )
 
+        print(df.shape)
         # 2) add time columns (scan_hour_unix / scan_halfhour_unix, scan_date, ...)
         df = utils.add_time_columns(df)
+        print(df.shape)
 
         # 3) IMERG (optional)
         if _IMERG_META is not None:
@@ -211,7 +213,10 @@ def process_one_orbit(l2_file_str: str) -> tuple[str, bool, str]:
         )
         
         print("export df")
-        df.to_pickle("/scratch/omidzandi/evaluation/2010_collocated_with_ref_preci_test/___new_" + orbit_tag + "_df.pkl")
+        df.to_pickle("/home/omidzandi/check_old_new_2010_dfs/no_ret_" + orbit_tag + "_df.pkl")
+
+        # drop nan values of IMERG
+        df = df[np.isfinite(df["IMERG_preci"])]
 
         # 5) grid to WGS
         grids = _df_to_wgs_grids(df, x_vec, y_vec, x, y, grid_vars)

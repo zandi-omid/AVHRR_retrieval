@@ -334,7 +334,7 @@ def read_AVHRR_orbit_to_df(
     lon_f = lon_m.ravel()
     time_f = ts_2d.ravel()
     var_f = {k: v.ravel() for k, v in var_arrays.items()}
-
+    
     # (7) build unified mask
     valid = _build_valid_mask(lat_f, lon_f, time_f, var_f)
     if not valid.any():
